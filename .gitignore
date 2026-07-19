@@ -1,0 +1,4 @@
+memory_pool/memory_pool
+*.o
+build/
+cmake-build-*/
