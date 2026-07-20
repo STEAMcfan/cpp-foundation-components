@@ -1,4 +1,9 @@
 memory_pool/memory_pool
 *.o
+*.obj
+*.exe
 build/
 cmake-build-*/
+.vs/
+.vscode/
+.idea/
