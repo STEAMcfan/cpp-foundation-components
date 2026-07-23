@@ -3,6 +3,7 @@ memory_pool/memory_pool
 *.obj
 *.exe
 build/
+build-*/
 cmake-build-*/
 .vs/
 .vscode/
