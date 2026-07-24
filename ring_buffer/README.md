@@ -84,6 +84,149 @@ RingBuffer 的关键不是数组本身，而是三个边界问题：
 
 ## Interview Handwritten Version
 
+如果面试官说“手撕一个 ring buffer 组件”，不要只写 `vector<int> + head + tail`。那个只能证明你知道循环数组，不能体现组件设计。更完整的手撕版本应该覆盖这些关键点：
+
+- `head` 读、`tail` 写、`size` 区分空和满。
+- 固定容量，push/pop 都是 `O(1)`。
+- 满时策略：普通队列拒绝写入，实时数据可以覆盖最旧值。
+- 线程安全：用 `mutex + condition_variable` 支持生产者消费者等待。
+- `close()`：关闭后拒绝写入，并唤醒阻塞线程，避免析构或退出时卡死。
+
+推荐面试手撕这个版本，既不夸张到 lock-free，又能把组件关键逻辑讲完整：
+
+```cpp
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+template <class T>
+class RingBuffer {
+public:
+    explicit RingBuffer(size_t cap, bool overwrite = false)
+        : buf_(cap), cap_(cap), overwrite_(overwrite) {
+        if (cap_ == 0) throw std::invalid_argument("capacity must be > 0");
+    }
+
+    bool tryPush(T x) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (closed_) return false;
+
+        if (size_ == cap_) {
+            if (!overwrite_) return false;
+            head_ = next(head_); // drop oldest
+            --size_;
+        }
+
+        buf_[tail_] = std::move(x);
+        tail_ = next(tail_);
+        ++size_;
+        lock.unlock();
+        not_empty_.notify_one();
+        return true;
+    }
+
+    bool waitPush(T x) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        not_full_.wait(lock, [&] {
+            return closed_ || overwrite_ || size_ < cap_;
+        });
+
+        if (closed_) return false;
+
+        if (size_ == cap_) {
+            head_ = next(head_); // overwrite mode
+            --size_;
+        }
+
+        buf_[tail_] = std::move(x);
+        tail_ = next(tail_);
+        ++size_;
+        lock.unlock();
+        not_empty_.notify_one();
+        return true;
+    }
+
+    std::optional<T> tryPop() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (size_ == 0) return std::nullopt;
+
+        T ans = std::move(*buf_[head_]);
+        buf_[head_].reset();
+        head_ = next(head_);
+        --size_;
+        lock.unlock();
+        not_full_.notify_one();
+        return ans;
+    }
+
+    std::optional<T> waitPop() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        not_empty_.wait(lock, [&] {
+            return closed_ || size_ > 0;
+        });
+
+        if (size_ == 0) return std::nullopt; // closed and drained
+
+        T ans = std::move(*buf_[head_]);
+        buf_[head_].reset();
+        head_ = next(head_);
+        --size_;
+        lock.unlock();
+        not_full_.notify_one();
+        return ans;
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            closed_ = true;
+        }
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return size_;
+    }
+
+    bool empty() const { return size() == 0; }
+
+private:
+    size_t next(size_t i) const {
+        return (i + 1) % cap_;
+    }
+
+    std::vector<std::optional<T>> buf_;
+    size_t cap_ = 0;
+    size_t head_ = 0; // next read position
+    size_t tail_ = 0; // next write position
+    size_t size_ = 0;
+    bool overwrite_ = false;
+    bool closed_ = false;
+
+    mutable std::mutex mtx_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+};
+```
+
+这个版本的讲解重点：
+
+1. `size_` 是解决 `head == tail` 歧义的核心。没有 `size_` 时，`head == tail` 既可能是空，也可能是满。
+2. `tail_` 永远指向下一次写的位置，`head_` 永远指向下一次读的位置。
+3. 每次移动下标都调用 `next()`，让数组尾部自然绕回开头。
+4. 满时拒绝写入是队列语义；满时覆盖最旧值是日志、指标、音视频帧这类“只关心最新数据”的语义。
+5. 阻塞版本必须用 `while/predicate wait`，因为条件变量可能虚假唤醒。
+6. 修改状态后解锁，再 `notify_one()`，不要让被唤醒线程马上抢同一把锁。
+7. `close()` 是生产级组件容易漏掉的点：没有 close，消费者可能永远卡在 `waitPop()`。
+
+如果面试官继续追问“为什么工程版不用 `vector<optional<T>>`”，再说：生产代码里可以用 `aligned_storage` / placement new 管对象生命周期，避免要求 `T` 默认构造，也能更精细地控制构造和析构。手撕时用 `optional<T>` 更清楚、更稳。
+
 面试手撕时先写维护 `size` 的版本，最稳、最容易讲清楚：
 
 ```cpp
