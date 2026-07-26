@@ -104,20 +104,58 @@ epoll 的关键不是“会调用三个系统调用”，而是理解它的模�
 
 ## Interview Handwritten Version
 
-面试手撕时，优先写“非阻塞 echo server 核心循环”。不要一上来封装大框架，先把 epoll 的本质写出来：
+面试手撕 epoll 时，先把三板斧写清楚，再把它放进 echo server。这样面试官能看到你理解的是“事件通知模型”，不是只背了一段网络代码。
+
+最小骨架：
+
+```cpp
+// 1. 创建 epoll 实例。epfd 是一个“事件中心”的 fd。
+int epfd = epoll_create1(0);
+
+// 2. 用 epoll_ctl 把要监听的 fd 加进去。
+epoll_event ev{};
+ev.events = EPOLLIN | EPOLLET;
+ev.data.fd = listenfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+
+// 3. 用 epoll_wait 等待事件发生。
+epoll_event events[1024];
+while (true) {
+    int n = epoll_wait(epfd, events, 1024, -1);
+    for (int i = 0; i < n; ++i) {
+        int fd = events[i].data.fd;
+        // fd == listenfd: accept 新连接
+        // fd != listenfd: read/write 普通客户端连接
+    }
+}
+```
+
+完整手撕版本推荐写成“非阻塞 echo server 核心循环”：
 
 ```cpp
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void add_fd(int epfd, int fd, uint32_t events) {
+    epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+void del_fd(int epfd, int fd) {
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
 }
 
 int main() {
@@ -134,52 +172,62 @@ int main() {
     bind(listenfd, (sockaddr*)&addr, sizeof(addr));
     listen(listenfd, SOMAXCONN);
 
+    // epoll_create1: 创建 epoll 实例，epfd 用来管理一组 fd 的事件。
     int epfd = epoll_create1(0);
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = listenfd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+
+    // epoll_ctl ADD: 把监听 socket 加进 epoll。
+    // listenfd 可读，表示有新客户端连接可以 accept。
+    add_fd(epfd, listenfd, EPOLLIN | EPOLLET);
 
     epoll_event events[1024];
     char buf[4096];
 
     while (true) {
+        // epoll_wait: 阻塞等待就绪事件，返回本轮有事件的 fd 数量。
         int n = epoll_wait(epfd, events, 1024, -1);
+
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
+            uint32_t ev = events[i].events;
 
             if (fd == listenfd) {
+                // listenfd 的 EPOLLIN 表示“有新连接”，要 accept。
+                // ET 模式下必须一直 accept 到 EAGAIN。
                 while (true) {
                     int connfd = accept(listenfd, nullptr, nullptr);
                     if (connfd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         continue;
                     }
-                    set_nonblock(connfd);
-                    epoll_event cev{};
-                    cev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-                    cev.data.fd = connfd;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &cev);
-                }
-            } else {
-                if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
-                    continue;
-                }
 
+                    set_nonblock(connfd);
+
+                    // epoll_ctl ADD: 新客户端 fd 也交给 epoll 监听。
+                    // connfd 可读，表示客户端发来了数据。
+                    add_fd(epfd, connfd, EPOLLIN | EPOLLET | EPOLLRDHUP);
+                }
+                continue;
+            }
+
+            if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                // epoll_ctl DEL: 连接异常或对端关闭时，从 epoll 中删除 fd。
+                del_fd(epfd, fd);
+                continue;
+            }
+
+            if (ev & EPOLLIN) {
+                // 普通客户端 fd 的 EPOLLIN 表示“有数据可读”。
+                // ET 模式下必须一直 read 到 EAGAIN。
                 while (true) {
                     int m = read(fd, buf, sizeof(buf));
                     if (m > 0) {
                         write(fd, buf, m); // demo: echo back
                     } else if (m == 0) {
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                        close(fd);
+                        del_fd(epfd, fd);
                         break;
                     } else {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                        close(fd);
+                        del_fd(epfd, fd);
                         break;
                     }
                 }
@@ -191,12 +239,15 @@ int main() {
 
 手写讲解顺序：
 
-1. `listenfd` 设置非阻塞，注册到 epoll。
-2. `epoll_wait()` 阻塞等待事件，不需要像 `select` 那样每次扫描所有 fd。
-3. 监听 fd 可读表示有新连接，要循环 `accept()` 到 `EAGAIN`。
-4. 连接 fd 可读表示有数据，要循环 `read()` 到 `EAGAIN`。
-5. ET 模式通知次数少，但必须一次把内核缓冲区读空。
-6. 真正生产级 echo 不能直接裸 `write()`，应该维护每个连接的输出缓冲，写不完就注册 `EPOLLOUT`。
+1. `epoll_create1()` 创建 epoll 实例，返回 `epfd`，它代表一个事件中心。
+2. `epoll_ctl(..., EPOLL_CTL_ADD, ...)` 把 `listenfd` 注册进去，关注 `EPOLLIN`。
+3. `epoll_wait()` 阻塞等待事件，返回本轮就绪的 fd。
+4. 如果就绪的是 `listenfd`，说明有新连接，要循环 `accept()` 到 `EAGAIN`。
+5. 如果就绪的是普通客户端 fd，说明有数据或断开，要 `read()` / `close()`。
+6. 每个新 `connfd` 也要用 `epoll_ctl ADD` 加入 epoll，否则后续客户端发数据你收不到通知。
+7. 连接关闭时用 `epoll_ctl DEL` 删除 fd，然后 `close(fd)`。
+8. ET 模式通知次数少，但必须配合非阻塞 fd，并且一次读写到 `EAGAIN`。
+9. 真正生产级 echo 不能直接裸 `write()`，应该维护每个连接的输出缓冲，写不完就注册 `EPOLLOUT`。
 
 ## Possible Interview Questions
 
