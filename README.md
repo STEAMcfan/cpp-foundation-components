@@ -13,5 +13,6 @@ Reusable foundational components implemented in C/C++ for systems programming pr
 - `ring_buffer`: C++17 bounded circular buffer with blocking/non-blocking APIs, overwrite mode, demo, tests, and interview notes
 - `memory_leak_detector`: C++17 debug memory leak detector with global new/delete hooks, snapshots, reports, demo, tests, and interview notes
 - `epoll`: C++17 Linux epoll reactor with nonblocking IO demos, echo server, tests, and interview notes
+- `multi_thread_reactor`: C++17 Linux multi-thread reactor with eventfd wakeups, worker loops, echo server, tests, and interview notes
 
 Each component is intentionally small enough to read in one sitting, but complete enough to compile, run, and discuss in an interview.
